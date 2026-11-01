@@ -5,7 +5,10 @@ import logging
 import os
 import sys
 import grp
-import acl
+import pwd
+import shutil
+import stat
+import subprocess
 from rich.console import Console
 from rich.table import Column, Table
 
@@ -13,8 +16,15 @@ from rich.table import Column, Table
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Constants ---
-DEFAULT_USER = os.getlogin()  # Get the current user's login name
 DEFAULT_PATH = "."  # Current directory
+
+
+def resolve_default_user() -> str:
+    """Returns the current user's login name, resolved lazily at run time."""
+    try:
+        return os.getlogin()
+    except OSError:
+        return pwd.getpwuid(os.getuid()).pw_name
 
 # --- Helper Functions ---
 
@@ -43,24 +53,80 @@ def get_user_groups(user: str) -> list:
 
 def get_file_acl(path: str) -> list:
     """
-    Retrieves the ACL entries for a given file or directory.
+    Retrieves the ACL entries for a given file or directory by reading the
+    output of getfacl when that tool is available.
 
     Args:
         path: The path to the file or directory.
 
     Returns:
-        A list of ACL entries. Returns an empty list if there are no ACL entries or if the file does not exist.
-        Each entry is a dictionary with keys like 'type', 'id', and 'permissions'.
+        A list of ACL entries. Returns an empty list if getfacl is not
+        available or the file does not exist. Each entry is a dictionary
+        with keys 'type', 'id', and 'permissions'.
     """
+    getfacl = shutil.which("getfacl")
+    if getfacl is None:
+        logging.info("getfacl is not available; no ACL entries were read.")
+        return []
     try:
-        acl_entries = acl.acl(file=path).get()
-        return acl_entries
+        result = subprocess.run(
+            [getfacl, "--absolute-names", path],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
     except FileNotFoundError:
         logging.error(f"File or directory not found: {path}")
         return []
     except OSError as e:
         logging.error(f"Error retrieving ACL for {path}: {e}")
         return []
+
+    owner = None
+    owning_group = None
+    raw_entries = []
+    mask_perms = None
+    for line in result.stdout.splitlines():
+        if line.startswith("# owner:"):
+            owner = line.split(":", 1)[1].strip()
+            continue
+        if line.startswith("# group:"):
+            owning_group = line.split(":", 1)[1].strip()
+            continue
+        if line.startswith("#") or not line.strip():
+            continue
+        parts = line.split(":")
+        if len(parts) < 3:
+            continue
+        entity_type, entity, perms = parts[0], parts[1], parts[2]
+        if entity_type == "mask":
+            mask_perms = perms
+        else:
+            raw_entries.append((entity_type, entity, perms))
+
+    def to_permissions(perms, apply_mask):
+        if apply_mask and mask_perms is not None:
+            perms = "".join(c for c in perms if c in mask_perms)
+        words = []
+        if "r" in perms:
+            words.append("read")
+        if "w" in perms:
+            words.append("write")
+        if "x" in perms:
+            words.append("execute")
+        return words
+
+    entries = []
+    for entity_type, entity, perms in raw_entries:
+        if entity_type == "user" and entity == "":
+            entries.append({"type": "user", "id": owner, "permissions": to_permissions(perms, False)})
+        elif entity_type == "user":
+            entries.append({"type": "user", "id": entity, "permissions": to_permissions(perms, True)})
+        elif entity_type == "group" and entity == "":
+            entries.append({"type": "group", "id": owning_group, "permissions": to_permissions(perms, True)})
+        elif entity_type == "group":
+            entries.append({"type": "group", "id": entity, "permissions": to_permissions(perms, True)})
+    return entries
 
 def calculate_effective_permissions(user: str, path: str) -> dict:
     """
@@ -78,20 +144,25 @@ def calculate_effective_permissions(user: str, path: str) -> dict:
     user_groups = get_user_groups(user)
     acl_entries = get_file_acl(path)
 
-    # Check file owner permissions
+    # Apply the file mode bits that match the user's relation to the file:
+    # owner bits for the owner, group bits for a member of the file's group,
+    # and other bits for everyone else.
     try:
-        import stat
         file_stat = os.stat(path)
-        owner_uid = file_stat.st_uid
-        import pwd
-        owner_username = pwd.getpwuid(owner_uid).pw_name
+        owner_username = pwd.getpwuid(file_stat.st_uid).pw_name
+        file_group = grp.getgrgid(file_stat.st_gid).gr_name
+        mode = file_stat.st_mode
         if owner_username == user:
-            mode = file_stat.st_mode
-            effective_permissions['read'] = bool(mode & stat.S_IRUSR)
-            effective_permissions['write'] = bool(mode & stat.S_IWUSR)
-            effective_permissions['execute'] = bool(mode & stat.S_IXUSR)
-    except (FileNotFoundError, OSError, ImportError, KeyError) as e:
-        logging.warning(f"Could not determine owner permissions for {path}: {e}")
+            read_bit, write_bit, exec_bit = stat.S_IRUSR, stat.S_IWUSR, stat.S_IXUSR
+        elif file_group in user_groups:
+            read_bit, write_bit, exec_bit = stat.S_IRGRP, stat.S_IWGRP, stat.S_IXGRP
+        else:
+            read_bit, write_bit, exec_bit = stat.S_IROTH, stat.S_IWOTH, stat.S_IXOTH
+        effective_permissions['read'] = effective_permissions['read'] or bool(mode & read_bit)
+        effective_permissions['write'] = effective_permissions['write'] or bool(mode & write_bit)
+        effective_permissions['execute'] = effective_permissions['execute'] or bool(mode & exec_bit)
+    except (FileNotFoundError, OSError, KeyError) as e:
+        logging.warning(f"Could not determine mode permissions for {path}: {e}")
 
     # Check ACL entries
     for entry in acl_entries:
@@ -151,7 +222,7 @@ def setup_argparse() -> argparse.ArgumentParser:
         An argparse.ArgumentParser object.
     """
     parser = argparse.ArgumentParser(description="Calculates effective permissions for a user on a given resource.")
-    parser.add_argument("-u", "--user", type=str, default=DEFAULT_USER, help=f"The username to check permissions for (default: {DEFAULT_USER})")
+    parser.add_argument("-u", "--user", type=str, default=None, help="The username to check permissions for (default: the current user)")
     parser.add_argument("-p", "--path", type=str, default=DEFAULT_PATH, help=f"The path to the file or directory (default: {DEFAULT_PATH})")
     return parser
 
@@ -163,8 +234,14 @@ def main():
     parser = setup_argparse()
     args = parser.parse_args()
 
-    user = args.user
+    user = args.user if args.user is not None else resolve_default_user()
     path = args.path
+
+    try:
+        pwd.getpwnam(user)
+    except KeyError:
+        logging.error(f"Error: User '{user}' could not be resolved.")
+        sys.exit(1)
 
     # Input validation
     if not os.path.exists(path):
@@ -185,32 +262,6 @@ def main():
     except Exception as e:
         logging.error(f"An unexpected error occurred: {e}")
         sys.exit(1)
-
-# --- Offensive Tool Steps ---
-# Include steps for offensive tools (simulated here - replace with actual offensive actions).
-# This simulates actions an attacker might take after assessing permissions.
-
-def simulate_offensive_actions(user: str, path: str, permissions: dict):
-    """
-    Simulates offensive actions based on calculated permissions.  This is a placeholder.
-    Replace with actual offensive actions.
-    """
-    logging.info(f"Simulating offensive actions for user {user} on {path}:")
-    if permissions['read']:
-        logging.info(f"- User {user} can read {path}.")
-        # Simulate reading the file content (replace with actual file reading)
-        logging.info(f"  - Simulated: Reading content of {path}...")
-
-    if permissions['write']:
-        logging.info(f"- User {user} can write to {path}.")
-        # Simulate writing to the file (replace with actual file writing)
-        logging.info(f"  - Simulated: Attempting to modify {path}...")
-
-    if permissions['execute']:
-        logging.info(f"- User {user} can execute {path} (if it's an executable).")
-        # Simulate executing the file (replace with actual execution)
-        logging.info(f"  - Simulated: Executing {path}...")
-
 
 if __name__ == "__main__":
     main()
