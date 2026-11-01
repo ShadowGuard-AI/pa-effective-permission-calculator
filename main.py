@@ -19,6 +19,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 DEFAULT_PATH = "."  # Current directory
 
 
+# os.getlogin reads the login session and fails under cron, systemd,
+# and most ssh one shots, which is why the uid lookup is the fallback.
+# If the uid has no passwd entry either, that KeyError escapes.
 def resolve_default_user() -> str:
     """Returns the current user's login name, resolved lazily at run time."""
     try:
@@ -119,6 +122,10 @@ def get_file_acl(path: str) -> list:
     entries = []
     for entity_type, entity, perms in raw_entries:
         if entity_type == "user" and entity == "":
+            # The owning user entry skips the mask on purpose: POSIX caps named
+            # users and the group class with the mask, never the owner. The mask
+            # test itself is character membership, which works because getfacl
+            # prints permissions as an rwx string with dashes for absent bits.
             entries.append({"type": "user", "id": owner, "permissions": to_permissions(perms, False)})
         elif entity_type == "user":
             entries.append({"type": "user", "id": entity, "permissions": to_permissions(perms, True)})
@@ -164,6 +171,10 @@ def calculate_effective_permissions(user: str, path: str) -> dict:
     except (FileNotFoundError, OSError, KeyError) as e:
         logging.warning(f"Could not determine mode permissions for {path}: {e}")
 
+    # My merge is a plain OR across mode bits and ACL entries. The kernel
+    # instead picks the first matching class and stops, so a named user
+    # entry that narrows access cannot narrow anything here: bits from a
+    # wider class the kernel would never reach still count for me.
     # Check ACL entries
     for entry in acl_entries:
         if entry['type'] == 'user' and entry['id'] == user:
@@ -175,6 +186,9 @@ def calculate_effective_permissions(user: str, path: str) -> dict:
             effective_permissions['write'] = effective_permissions['write'] or ('write' in entry['permissions'])
             effective_permissions['execute'] = effective_permissions['execute'] or ('execute' in entry['permissions'])
 
+        # This deny block never fires on data get_file_acl produces: POSIX
+        # ACLs have no deny entries and the parser never sets a deny key. It
+        # is written for a Windows style ACL shape this tool does not read.
         # Handle explicit denials (more complex logic may be needed for real ACLs)
         if entry['type'] == 'user' and entry['id'] == user and 'deny' in entry and entry['deny']:
             if 'read' in entry['permissions']:
