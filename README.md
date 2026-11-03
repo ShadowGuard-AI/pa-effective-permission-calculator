@@ -4,15 +4,20 @@ Calculates the effective permissions a user has on a specific resource, taking i
 The user defaults to the current user, resolved when the program runs and only when -u is not given, so --help works on machines without a login session. A named user who cannot be resolved exits 1 before any calculation.
 
 ## Install
-`git clone https://github.com/ShadowStrikeHQ/pa-effective-permission-calculator`
+`git clone https://github.com/ShadowGuard-AI/pa-effective-permission-calculator`
+`pip install -r requirements.txt`
 
 ## Usage
-`./pa-effective-permission-calculator [params]`
+`python3 main.py [-u USER] [-p PATH]`
 
 ## Parameters
 - `-h`: Show help message and exit
-- `-u`: No description provided
-- `-p`: No description provided
+- `-u, --user`: The username to check permissions for (default: the current user, resolved at run time only when -u is not given)
+- `-p, --path`: The path to the file or directory (default: `.`, the current directory)
+
+## Verified behavior
+- `python3 -m py_compile main.py` passes, but `python3 main.py --help` fails in this sandbox at import: `rich` is not installed, and installs are forbidden in this wave. The parameter list above is taken from the argument parser in `main.py`, and no live calculation is claimed here. A live run also needs `getfacl` for ACL entries; without it, the result rests on the mode bits, as the opening states.
+- Exit 1 cases, read from the code: a named user who cannot be resolved, and a path that does not exist.
 
 ## License
-Copyright (c) ShadowStrikeHQ
+See LICENSE.
